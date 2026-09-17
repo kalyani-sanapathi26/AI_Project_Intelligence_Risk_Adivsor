@@ -1,2 +1,12 @@
-.env
+__pycache__/
+*.pyc
+.venv/
 venv/
+.env
+.streamlit/secrets.toml
+chroma_db/
+vectorstore/
+uploads/
+*.csv
+*.zip
+.DS_Store
