@@ -4,7 +4,7 @@ from src.llm import generate_answer
 def analyze_blockers(chunks):
     """
     Analyze project documents and identify blockers
-    using a fixed output format.
+    and action items using a fixed output format.
     """
 
     context_parts = []
@@ -35,12 +35,13 @@ def analyze_blockers(chunks):
 - **Status:** Not specified in the uploaded documents
 """
 
-    prompt = f"""
+    question = """
 You are an AI Project Blocker and Action Item Identification Agent.
 
-Analyze ONLY the uploaded project documents.
+Analyze ONLY the provided project documents.
 
 Identify:
+
 1. Current blockers
 2. Unresolved issues
 3. Pending decisions
@@ -60,7 +61,7 @@ STRICT OUTPUT RULES:
 - Do not use alternative field names.
 - Create one separate block for every blocker.
 - Do not repeat the same blocker.
-- Use only information found in the uploaded documents.
+- Use only information found in the provided project documents.
 - Do not invent owners, priorities, or statuses.
 - If information is missing, write exactly:
   Not specified in the uploaded documents
@@ -95,14 +96,13 @@ USE ONLY THIS EXACT FORMAT:
 - **Status:** Open / In Progress / Blocked / Resolved / Not specified in the uploaded documents
 
 Repeat the same format for all unique blockers.
-
-Uploaded project documents:
-
-{context}
 """
 
     try:
-        response = generate_answer(prompt)
+        response = generate_answer(
+            question,
+            context
+        )
 
         if hasattr(response, "content"):
             return response.content.strip()
