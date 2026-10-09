@@ -7,7 +7,14 @@ from src.vector_store import store_embeddings
 from src.rag_pipeline import retrieve_documents
 from src.scope_agent import analyze_scope
 from src.risk_agent import analyze_risks
-from src.documentation_agent import generate_project_documentation, _response_text
+from src.documentation_agent import (
+    generate_project_documentation,
+    _response_text,
+    _fallback_user_stories,
+    _format_risk_records,
+    _clean_action_items,
+    _format_project_summary,
+)
 from src.health_agent import analyze_project_health
 from src.blocker_agent import analyze_blockers
 from src.llm import generate_answer
@@ -768,6 +775,12 @@ def _build_rag_context(results):
     return context
 
 
+def _prepare_project_scope_entry():
+    for analysis_key in ("scope_analysis", "risk_analysis", "blocker_analysis"):
+        if not st.session_state.get(analysis_key):
+            st.session_state[f"{analysis_key}_attempted"] = False
+
+
 # ---------------------------------------------------------
 # SESSION STATE
 # ---------------------------------------------------------
@@ -780,12 +793,18 @@ if "processed_documents" not in st.session_state:
 
 if "scope_analysis" not in st.session_state:
     st.session_state.scope_analysis = ""
+if "scope_analysis_attempted" not in st.session_state:
+    st.session_state.scope_analysis_attempted = bool(st.session_state.get("scope_analysis"))
 
 if "risk_analysis" not in st.session_state:
     st.session_state.risk_analysis = ""
+if "risk_analysis_attempted" not in st.session_state:
+    st.session_state.risk_analysis_attempted = bool(st.session_state.get("risk_analysis"))
 
 if "blocker_analysis" not in st.session_state:
     st.session_state.blocker_analysis = ""
+if "blocker_analysis_attempted" not in st.session_state:
+    st.session_state.blocker_analysis_attempted = bool(st.session_state.get("blocker_analysis"))
 
 if "health_analysis" not in st.session_state:
     st.session_state.health_analysis = ""
@@ -1154,6 +1173,8 @@ if st.session_state.selected_page == "Home":
                     else "secondary"
                 )
             ):
+                if page_name == "Project Scope":
+                    _prepare_project_scope_entry()
                 st.session_state.selected_page = page_name
                 st.rerun()
 
@@ -1282,8 +1303,10 @@ if selected_page == "Dashboard":
     blocker_analysis = st.session_state.get("blocker_analysis", "")
     documentation = st.session_state.get("documentation", "")
 
-    health_available = health_analysis is not None and bool(str(health_analysis).strip())
-    health_text = str(health_analysis) if health_available else ""
+    health_text = _response_text(health_analysis)
+    scope_text = _response_text(scope_analysis).replace("\\n", "\n")
+    documentation_text = _response_text(documentation).replace("\\n", "\n")
+    health_available = bool(health_text.strip())
     health_score_match = re.search(r"(?im)^\s*Score:\s*(\d{1,3})\s*/\s*100\b", health_text)
     health_score = min(100, int(health_score_match.group(1))) if health_score_match else None
     status_match = re.search(r"(?im)^\s*Status:\s*(.+?)\s*$", health_text)
@@ -1296,28 +1319,7 @@ if selected_page == "Dashboard":
         ("Documentation", documentation, "health-card"),
     ]
     analyses_count = sum(value is not None and bool(str(value).strip()) for _, value, _ in analysis_values)
-    metric_items = [
-        ("Documents", len(processed_documents), "document-card", "#67d5ff", '<svg viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6zM14 3v5h5M9 13h6M9 17h6"/></svg>'),
-        ("Indexed Chunks", indexed_chunks, "risk-card", "#b58cff", '<svg viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5"/></svg>'),
-        ("Project Health", f"{health_score}/100 · {health_status}" if health_available and health_score is not None else (health_status if health_available else "Not analyzed"), "health-card", "#7ed6a5", '<svg viewBox="0 0 24 24"><path d="M20.8 8.7c0 5.1-8.8 11-8.8 11s-8.8-5.9-8.8-11A4.7 4.7 0 0 1 12 6.4a4.7 4.7 0 0 1 8.8 2.3Z"/><path d="M5 12h4l2-3 3 6 2-3h3"/></svg>'),
-        ("Analyses", f"{analyses_count} / 4", "blocker-card", "#ff9fba", '<svg viewBox="0 0 24 24"><path d="M4 19V5M4 19h17M8 16v-4m5 4V8m5 8V5"/></svg>'),
-    ]
-    metric_columns = st.columns(4)
-    for column, (title, value, card_class, accent, icon_svg) in zip(metric_columns, metric_items):
-        with column:
-            st.markdown(
-                f"""
-                <div class="metric-card {card_class}" style="min-height:112px;text-align:left;background:linear-gradient(145deg,#171d2b,#20283a);border:1px solid {accent}66;border-left:4px solid {accent};border-radius:16px;box-shadow:0 8px 24px rgba(0,0,0,.16),0 0 14px {accent}15;">
-                    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
-                        <div><div class="metric-title">{html.escape(str(title))}</div><div class="metric-value">{html.escape(str(value))}</div></div>
-                        <div style="width:42px;height:42px;flex:0 0 42px;border-radius:12px;display:grid;place-items:center;background:{accent}1c;border:1px solid {accent}55;box-shadow:0 0 14px {accent}22;">
-                            <span style="width:23px;height:23px;color:{accent};display:block;">{icon_svg.replace('<svg ', '<svg width="23" height="23" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" ')}</span>
-                        </div>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+    dashboard_kpi_slot = st.empty()
 
     dimensions = [
         "Scope Clarity", "Progress", "Timeline / Delivery",
@@ -1372,6 +1374,79 @@ if selected_page == "Dashboard":
         else:
             st.caption("No numeric dimension scores are available in the health analysis.")
 
+    scope_section_labels = (
+        "Project Overview", "Project Objective", "Project Scope",
+        "Main Modules / Features", "Key Deliverables",
+        "Important Requirements", "Important Deadlines / Milestones",
+    )
+    scope_label_pattern = "|".join(re.escape(label).replace(r"/", r"\s*/\s*") for label in scope_section_labels)
+    scope_pipe_pattern = re.compile(
+        rf"(?im)(?:^|\|)\s*(?:\d+\s*\|\s*)?(?:\*\*)?(?P<label>{scope_label_pattern})(?:\*\*)?\s*\|"
+    )
+    scope_matches = list(scope_pipe_pattern.finditer(scope_text))
+    dashboard_scope_sections = {}
+    if scope_matches:
+        for scope_index, scope_match in enumerate(scope_matches):
+            scope_end = scope_matches[scope_index + 1].start() if scope_index + 1 < len(scope_matches) else len(scope_text)
+            scope_value = scope_text[scope_match.end():scope_end].strip(" \t\r\n|")
+            scope_value = re.sub(r"\s*\|\s*", "\n", scope_value).strip()
+            if scope_value:
+                dashboard_scope_sections[scope_match.group("label").casefold()] = scope_value
+    else:
+        scope_line_pattern = re.compile(
+            rf"(?im)^\s*(?:#{{1,6}}\s*)?(?:\d+[.)]?\s*)?(?P<label>{scope_label_pattern})\s*:?[ \t]*(?P<inline>.*)$"
+        )
+        scope_lines = scope_text.splitlines()
+        scope_heading_matches = [(index, scope_line_pattern.match(line)) for index, line in enumerate(scope_lines)]
+        scope_heading_matches = [(index, match) for index, match in scope_heading_matches if match]
+        for scope_index, (line_index, scope_match) in enumerate(scope_heading_matches):
+            next_line = scope_heading_matches[scope_index + 1][0] if scope_index + 1 < len(scope_heading_matches) else len(scope_lines)
+            scope_value = "\n".join(([scope_match.group("inline")] if scope_match.group("inline").strip() else []) + scope_lines[line_index + 1:next_line]).strip()
+            if scope_value:
+                dashboard_scope_sections[scope_match.group("label").casefold()] = scope_value
+
+    st.markdown("### Scope Summary")
+    scope_card_columns = st.columns(2)
+    available_scope_sections = [
+        (key, label, value) for key, label in (
+            ("project overview", "Project Overview"),
+            ("project objective", "Project Objective"),
+            ("project scope", "Project Scope"),
+            ("main modules / features", "Main Modules / Features"),
+            ("key deliverables", "Key Deliverables"),
+            ("important requirements", "Important Requirements"),
+            ("important deadlines / milestones", "Important Deadlines / Milestones"),
+        ) if (value := dashboard_scope_sections.get(key))
+    ]
+    for scope_index, (_, scope_label, scope_value) in enumerate(available_scope_sections):
+        with scope_card_columns[scope_index % 2]:
+            with st.container(border=True):
+                st.markdown(f"#### {html.escape(scope_label)}")
+                if scope_label == "Project Overview":
+                    overview_fields = (
+                        ("Project Name", re.search(r"(?i)\bproject\s*(?:name|title)\s*[:：]\s*(.+?)(?=\s*(?:;|\n|\|)\s*(?:project\s*)?(?:objective|scope)\s*[:：]|$)", scope_value)),
+                        ("Project Objective", re.search(r"(?i)\b(?:project\s*)?objective\s*[:：]\s*(.+?)(?=\s*(?:;|\n|\|)\s*(?:project\s*)?(?:name|scope)\s*[:：]|$)", scope_value)),
+                    )
+                    overview_remaining = scope_value
+                    for field_label, field_match in overview_fields:
+                        if field_match:
+                            field_value = field_match.group(1).strip(" *|;")
+                            st.markdown(f"**{field_label}:** {field_value}")
+                            overview_remaining = overview_remaining.replace(field_match.group(0), "", 1)
+                    overview_remaining = re.sub(r"(?i)\b(?:project\s*)?(?:name|title|objective)\s*[:：]", "", overview_remaining).strip(" *|;\n")
+                    if overview_remaining:
+                        st.markdown(overview_remaining)
+                else:
+                    scope_items = [item.strip(" -*•") for item in re.split(r"[\n;•]+", scope_value) if item.strip(" -*•")]
+                    if len(scope_items) == 1 and scope_label in ("Project Scope", "Main Modules / Features"):
+                        scope_items = [item.strip() for item in scope_items[0].split(",") if item.strip()]
+                    if len(scope_items) == 1 and scope_label == "Important Requirements":
+                        scope_items = [item.strip() for item in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", scope_items[0]) if item.strip()]
+                    for scope_item in scope_items:
+                        st.markdown(f"- {scope_item}")
+    if not available_scope_sections:
+        st.caption("No structured scope sections are available in the current analysis.")
+
     work_status_records = {}
     work_status_categories = ("Completed", "In Progress", "Blocked", "Not Started")
     work_status_reliable = True
@@ -1406,10 +1481,11 @@ if selected_page == "Dashboard":
     work_status_counts = None
     if work_tables_found and work_status_records and work_status_reliable:
         work_status_counts = {status: sum(value == status for value in work_status_records.values()) for status in work_status_categories}
+    work_status_total = sum(work_status_counts.values()) if work_status_counts else 0
+    work_progress = round(work_status_counts.get("Completed", 0) / work_status_total * 100) if work_status_total else None
 
     risk_records = []
-    risk_text = str(risk_analysis or "").replace("\\n", "\n")
-    documentation_text = str(documentation or "").replace("\\n", "\n")
+    risk_text = _response_text(risk_analysis).replace("\\n", "\n")
     risk_register_match = re.search(
         r"(?ims)^\s*#\s*(?:2\.\s*)?RISK REGISTER\s*$\s*(.*?)(?=^\s*#\s*(?:3\.\s*)?ACTION ITEMS\b|\Z)",
         documentation_text,
@@ -1422,13 +1498,13 @@ if selected_page == "Dashboard":
         if not name_match:
             continue
         record = {"Risk": name_match.group(1).strip().strip("*")}
-        for field in ("Severity", "Impact", "Potential Project Impact", "Probability", "Likelihood", "Status", "Owner", "Reason", "Recommended Action"):
+        for field in ("Severity", "Priority", "Impact", "Potential Project Impact", "Probability", "Likelihood", "Status", "Owner", "Reason", "Recommended Action"):
             field_match = re.search(rf"(?im)^\s*(?:[-*•]\s*)?(?:\*\*)?{field}(?:\*\*)?\s*[:\-]\s*(.+?)\s*$", block)
             if field_match:
                 value = field_match.group(1).strip().strip("*")
                 if field == "Potential Project Impact" and not record.get("Impact"):
                     record["Impact"] = value
-                elif field in ("Impact", "Probability", "Likelihood", "Severity"):
+                elif field in ("Impact", "Probability", "Likelihood", "Severity", "Priority"):
                     record[field] = value
                     category_match = re.fullmatch(r"(?i)(High|Medium|Low)\.?", value)
                     if category_match:
@@ -1438,7 +1514,7 @@ if selected_page == "Dashboard":
         risk_records.append(record)
 
     risk_field_line = re.compile(
-        r"(?i)^\s*(?:[-*•]\s*)?(?:\*\*)?(?:Risk|Severity|Impact|Probability|"
+        r"(?i)^\s*(?:[-*•]\s*)?(?:\*\*)?(?:Risk|Severity|Priority|Impact|Probability|"
         r"Likelihood|Status|Owner|Reason|Potential Project Impact|Recommended Action)"
         r"(?:\*\*)?\s*[:\-]"
     )
@@ -1472,18 +1548,21 @@ if selected_page == "Dashboard":
             risk_records.append({"Risk": risk_name})
             known_risks.add(risk_name.casefold())
 
-    risk_severity_counts = None
-    if risk_records and all(record.get("Severity") in ("High", "Medium", "Low") for record in risk_records):
-        risk_severity_counts = {severity: sum(record["Severity"] == severity for record in risk_records) for severity in ("High", "Medium", "Low")}
-    risk_points = []
-    category_scale = {"Low": 1, "Medium": 2, "High": 3}
-
     def risk_category(value):
         match = re.match(r"(?i)^\s*(Low|Medium|High)\b", str(value or ""))
         return match.group(1).title() if match else None
 
+    risk_severity_counts = {
+        severity: sum(risk_category(record.get("Severity") or record.get("Priority")) == severity for record in risk_records)
+        for severity in ("High", "Medium", "Low")
+    }
+    if not any(risk_severity_counts.values()):
+        risk_severity_counts = None
+    risk_points = []
+    category_scale = {"Low": 1, "Medium": 2, "High": 3}
+
     risk_impact_levels = [risk_category(record.get("Impact")) for record in risk_records]
-    risk_severity_levels = [risk_category(record.get("Severity")) for record in risk_records]
+    risk_severity_levels = [risk_category(record.get("Severity") or record.get("Priority")) for record in risk_records]
     risk_distribution_counts = None
     if risk_records and any(risk_impact_levels):
         levels = [level or "Not specified" for level in risk_impact_levels]
@@ -1504,7 +1583,7 @@ if selected_page == "Dashboard":
                 "Probability Score": category_scale[probability],
             })
 
-    blocker_text = str(blocker_analysis or "").replace("\\n", "\n")
+    blocker_text = _response_text(blocker_analysis).replace("\\n", "\n")
     blocker_blocks = re.split(r"(?im)(?=^###\s+Blocker\s+\d+\b)", blocker_text)
     blocker_records = []
     for block in blocker_blocks:
@@ -1514,7 +1593,7 @@ if selected_page == "Dashboard":
         if not name_match or re.search(r"(?i)^(no blocker identified|unable to analyze blockers)", name_match.group(1).strip()):
             continue
         record = {"Blocker": name_match.group(1).strip()}
-        for field in ("Priority", "Status"):
+        for field in ("Description", "Priority", "Owner", "Required Action", "Status"):
             field_match = re.search(rf"(?im)^\s*-\s*\*\*{field}:\*\*\s*(.+?)\s*$", block)
             if field_match:
                 value = field_match.group(1).strip()
@@ -1522,14 +1601,79 @@ if selected_page == "Dashboard":
                     record[field] = value.title() if field == "Priority" else value
         blocker_records.append(record)
 
-    blocker_priority_counts = None
-    if blocker_records and all(record.get("Priority") in ("High", "Medium", "Low") for record in blocker_records):
-        blocker_priority_counts = {priority: sum(record["Priority"] == priority for record in blocker_records) for priority in ("High", "Medium", "Low")}
+    blocker_priority_counts = {
+        priority: sum(record.get("Priority") == priority for record in blocker_records)
+        for priority in ("High", "Medium", "Low")
+    }
+    if not any(blocker_priority_counts.values()):
+        blocker_priority_counts = None
     blocker_status_counts = None
     if blocker_records and all(record.get("Status") for record in blocker_records):
         blocker_status_counts = {}
         for record in blocker_records:
             blocker_status_counts[record["Status"]] = blocker_status_counts.get(record["Status"], 0) + 1
+
+    action_section_match = re.search(
+        r"(?ims)^\s*#*\s*(?:3\.\s*)?ACTION ITEMS\s*$\s*(.*?)(?=^\s*#*\s*(?:4\.\s*)?PROJECT SUMMARY\b|\Z)",
+        documentation_text,
+    )
+    action_records = []
+    if action_section_match:
+        for action_line in action_section_match.group(1).splitlines():
+            action_match = re.match(r"^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$", action_line)
+            if not action_match:
+                continue
+            action_text = action_match.group(1).strip()
+            if not action_text or action_text.casefold().startswith(("not found", "no documented actions")):
+                continue
+            action_record = {"Action": action_text}
+            for field in ("Priority", "Status"):
+                field_match = re.search(rf"(?i)\b{field}\s*:\s*([^;,|]+)", action_text)
+                if field_match and not field_match.group(1).strip().casefold().startswith(("not specified", "not found")):
+                    action_record[field] = field_match.group(1).strip()
+            action_records.append(action_record)
+    if not action_records:
+        for record in blocker_records:
+            action_text = record.get("Required Action", "").strip()
+            if action_text and action_text.casefold() not in {item["Action"].casefold() for item in action_records}:
+                action_records.append({
+                    "Action": action_text,
+                    **({"Priority": record["Priority"]} if record.get("Priority") else {}),
+                    **({"Status": record["Status"]} if record.get("Status") else {}),
+                })
+    if not action_records:
+        for record in risk_records:
+            for action_line in re.split(r"[\n;]+", record.get("Recommended Action", "")):
+                action_text = action_line.strip(" -*•")
+                if action_text and action_text.casefold() not in {item["Action"].casefold() for item in action_records}:
+                    action_records.append({"Action": action_text})
+    if not action_records:
+        health_actions_match = re.search(
+            r"(?ims)^\s*#\s*IMMEDIATE ACTIONS REQUIRED\s*$\s*(.*?)(?=^\s*#\s*[^\n]+|\Z)",
+            health_text,
+        )
+        if health_actions_match:
+            for action_line in health_actions_match.group(1).splitlines():
+                action_match = re.match(r"^\s*(?:[-*•]|\d+[.)])\s+(.+?)\s*$", action_line)
+                if action_match and not action_match.group(1).casefold().startswith(("not found", "insufficient information")):
+                    action_records.append({"Action": action_match.group(1).strip()})
+
+    dashboard_metrics = [
+        ("Project Health Score", f"{health_score}/100" if health_score is not None else ("Score unavailable" if health_available else "Not analyzed"), "#7ed6a5", '<svg viewBox="0 0 24 24"><path d="M20.8 8.7c0 5.1-8.8 11-8.8 11s-8.8-5.9-8.8-11A4.7 4.7 0 0 1 12 6.4a4.7 4.7 0 0 1 8.8 2.3Z"/><path d="M5 12h4l2-3 3 6 2-3h3"/></svg>'),
+        ("Total Risks", len(risk_records) if risk_records else "—", "#ff9f43", '<svg viewBox="0 0 24 24"><path d="m12 3 10 18H2L12 3Z"/><path d="M12 9v5m0 3h.01"/></svg>'),
+        ("Total Blockers", len(blocker_records) if blocker_records else "—", "#ff6f91", '<svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>'),
+        ("Total Action Items", len(action_records) if action_records else "—", "#b58cff", '<svg viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>'),
+    ]
+    if work_progress is not None:
+        dashboard_metrics.append(("Project Progress", f"{work_progress}%", "#67d5ff", '<svg viewBox="0 0 24 24"><path d="M4 19V5M4 19h17M8 16v-4m5 4V8m5 8V5"/></svg>'))
+    with dashboard_kpi_slot.container():
+        metric_columns = st.columns(len(dashboard_metrics))
+        for column, (title, value, accent, icon_svg) in zip(metric_columns, dashboard_metrics):
+            with column:
+                st.markdown(
+                    f"<div class='metric-card' style='min-height:112px;text-align:left;background:linear-gradient(145deg,#171d2b,#20283a);border:1px solid {accent}66;border-left:4px solid {accent};border-radius:16px;padding:16px;box-shadow:0 8px 24px rgba(0,0,0,.16),0 0 14px {accent}15;'><div style='display:flex;align-items:center;justify-content:space-between;gap:10px;'><div><div class='metric-title'>{html.escape(title)}</div><div class='metric-value'>{html.escape(str(value))}</div></div><span style='width:38px;height:38px;display:grid;place-items:center;border-radius:11px;background:{accent}1c;border:1px solid {accent}55;color:{accent};'>{icon_svg.replace('<svg ', '<svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" ')}</span></div></div>",
+                    unsafe_allow_html=True,
+                )
 
     st.markdown("### Project Work Status")
     with st.container(border=True, key="dashboard_work_status"):
@@ -1555,6 +1699,14 @@ if selected_page == "Dashboard":
                 st.bar_chart({"Category": ["Documented risks"], "Count": [len(risk_records)]}, x="Category", y="Count", color="#ff9f43")
             else:
                 st.caption("No documented risk entries are available in Risk Analysis or the generated Risk Register.")
+            if risk_severity_counts:
+                st.markdown("#### Risks by Severity")
+                st.bar_chart(
+                    {"Severity": list(risk_severity_counts), "Risks": list(risk_severity_counts.values())},
+                    x="Severity", y="Risks", color="#ff9f43",
+                )
+                if sum(risk_severity_counts.values()) < len(risk_records):
+                    st.caption("Only risks with documented severity or priority are included in this chart.")
     with risk_summary_column:
         with st.container(border=True, key="dashboard_risk_summary"):
             st.markdown("#### Risk Summary")
@@ -1567,8 +1719,25 @@ if selected_page == "Dashboard":
                 if "Not specified" in risk_distribution_counts:
                     st.caption(f"Not specified: {risk_distribution_counts['Not specified']}")
             if risk_records:
+                risk_filtered_records = list(risk_records)
+                risk_severity_options = sorted({record.get("Severity") or record.get("Priority") for record in risk_records if record.get("Severity") or record.get("Priority")})
+                risk_status_options = sorted({record["Status"] for record in risk_records if record.get("Status")})
+                risk_filter_columns = st.columns(2)
+                selected_risk_severities = []
+                selected_risk_statuses = []
+                if risk_severity_options:
+                    with risk_filter_columns[0]:
+                        selected_risk_severities = st.multiselect("Filter severity", risk_severity_options, key="dashboard_risk_severity_filter")
+                if risk_status_options:
+                    with risk_filter_columns[1]:
+                        selected_risk_statuses = st.multiselect("Filter status", risk_status_options, key="dashboard_risk_status_filter")
+                risk_filtered_records = [
+                    record for record in risk_records
+                    if (not selected_risk_severities or (record.get("Severity") or record.get("Priority")) in selected_risk_severities)
+                    and (not selected_risk_statuses or record.get("Status") in selected_risk_statuses)
+                ]
                 risk_display_fields = [
-                    ("Risk Name", "Risk"), ("Severity", "Severity"),
+                    ("Risk Name", "Risk"), ("Severity", "Severity"), ("Priority", "Priority"),
                     ("Impact", "Impact"), ("Probability", "Probability"),
                     ("Status", "Status"), ("Owner", "Owner"),
                 ]
@@ -1577,7 +1746,7 @@ if selected_page == "Dashboard":
                     if key == "Risk" or any(record.get(key) or (key == "Probability" and record.get("Likelihood")) for record in risk_records)
                 ]
                 risk_table = []
-                for record in risk_records:
+                for record in risk_filtered_records:
                     row = {}
                     for label, key in risk_display_fields:
                         row[label] = record.get("Probability", record.get("Likelihood", "")) if key == "Probability" else record.get(key, "")
@@ -1592,6 +1761,18 @@ if selected_page == "Dashboard":
                         for label, _ in risk_display_fields
                     },
                 )
+                if risk_filtered_records:
+                    with st.expander("Inspect Risk Details"):
+                        selected_risk_index = st.selectbox(
+                            "Select a risk",
+                            range(len(risk_filtered_records)),
+                            format_func=lambda index: risk_filtered_records[index]["Risk"],
+                            key="dashboard_risk_detail_select",
+                        )
+                        selected_risk = risk_filtered_records[selected_risk_index]
+                        for field in ("Severity", "Priority", "Impact", "Probability", "Status", "Owner", "Reason", "Recommended Action"):
+                            if selected_risk.get(field):
+                                st.markdown(f"**{field}:** {selected_risk[field]}")
             else:
                 st.caption("No documented risks are available to display.")
 
@@ -1606,6 +1787,51 @@ if selected_page == "Dashboard":
             st.caption(f"{len(blocker_records)} documented blocker(s); priority and status are not reliably available.")
         else:
             st.caption("No reliably structured blocker entries are available.")
+    if blocker_records:
+        blocker_priority_options = sorted({record["Priority"] for record in blocker_records if record.get("Priority")})
+        blocker_status_options = sorted({record["Status"] for record in blocker_records if record.get("Status")})
+        blocker_filter_columns = st.columns(2)
+        selected_blocker_priorities = []
+        selected_blocker_statuses = []
+        if blocker_priority_options:
+            with blocker_filter_columns[0]:
+                selected_blocker_priorities = st.multiselect("Filter blocker priority", blocker_priority_options, key="dashboard_blocker_priority_filter")
+        if blocker_status_options:
+            with blocker_filter_columns[1]:
+                selected_blocker_statuses = st.multiselect("Filter blocker status", blocker_status_options, key="dashboard_blocker_status_filter")
+        filtered_blockers = [
+            record for record in blocker_records
+            if (not selected_blocker_priorities or record.get("Priority") in selected_blocker_priorities)
+            and (not selected_blocker_statuses or record.get("Status") in selected_blocker_statuses)
+        ]
+        with st.expander("Inspect Blocker Details"):
+            for index, record in enumerate(filtered_blockers, start=1):
+                st.markdown(f"**{index}. {record['Blocker']}**")
+                for field in ("Description", "Priority", "Owner", "Required Action", "Status"):
+                    if record.get(field):
+                        st.markdown(f"- **{field}:** {record[field]}")
+
+    st.markdown("### Action Items")
+    if action_records:
+        action_priority_options = sorted({record["Priority"] for record in action_records if record.get("Priority")})
+        action_status_options = sorted({record["Status"] for record in action_records if record.get("Status")})
+        action_filter_columns = st.columns(2)
+        selected_action_priorities = []
+        selected_action_statuses = []
+        if action_priority_options:
+            with action_filter_columns[0]:
+                selected_action_priorities = st.multiselect("Filter action priority", action_priority_options, key="dashboard_action_priority_filter")
+        if action_status_options:
+            with action_filter_columns[1]:
+                selected_action_statuses = st.multiselect("Filter action status", action_status_options, key="dashboard_action_status_filter")
+        filtered_actions = [
+            record for record in action_records
+            if (not selected_action_priorities or record.get("Priority") in selected_action_priorities)
+            and (not selected_action_statuses or record.get("Status") in selected_action_statuses)
+        ]
+        st.dataframe(filtered_actions, hide_index=True, use_container_width=True)
+    else:
+        st.caption("No action items are available in the current documentation or blocker analysis.")
 
     coverage = [
         ("Scope Analysis", scope_analysis, "#67d5ff", '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3"/></svg>'),
@@ -2550,6 +2776,7 @@ if selected_page == "RAG Pipeline":
             st.rerun()
     with rag_navigation_columns[2]:
         if st.button("Go to Project Scope →", key="rag_next_scope", use_container_width=True):
+            _prepare_project_scope_entry()
             st.session_state.selected_page = "Project Scope"
             st.rerun()
 
@@ -2702,6 +2929,7 @@ if selected_page == "Project Scope":
                 "deliverables requirements deadlines milestones",
                 top_k=6
             )
+            st.session_state.scope_analysis_attempted = True
 
             if scope_chunks:
 
@@ -2727,6 +2955,48 @@ if selected_page == "Project Scope":
                     "No relevant project information found "
                     "in the uploaded project documents."
                 )
+
+    if st.session_state.get("processed_documents"):
+        if not st.session_state.get("scope_analysis_attempted"):
+            scope_chunks = retrieve_documents(
+                "project objective scope modules features "
+                "deliverables requirements deadlines milestones",
+                top_k=6
+            )
+            st.session_state.scope_analysis_attempted = True
+            if scope_chunks:
+                with st.spinner("Analyzing project scope..."):
+                    st.session_state.scope_analysis = analyze_scope(scope_chunks)
+            else:
+                st.warning("No relevant project information found in the uploaded project documents.")
+
+        if st.session_state.get("scope_analysis"):
+            if not st.session_state.get("risk_analysis") and not st.session_state.get("risk_analysis_attempted"):
+                risk_chunks = retrieve_documents(
+                    "project risks blockers delays dependencies "
+                    "schedule delivery challenges issues problems",
+                    top_k=6
+                )
+                st.session_state.risk_analysis_attempted = True
+                if risk_chunks:
+                    with st.spinner("Analyzing project risks..."):
+                        st.session_state.risk_analysis = analyze_risks(risk_chunks)
+                else:
+                    st.warning("No relevant project risk information found in the uploaded project documents.")
+
+            if not st.session_state.get("blocker_analysis") and not st.session_state.get("blocker_analysis_attempted"):
+                blocker_chunks = retrieve_documents(
+                    "current blockers unresolved issues pending decisions "
+                    "action items dependencies delays problems "
+                    "testing integration development schedule",
+                    top_k=10
+                )
+                st.session_state.blocker_analysis_attempted = True
+                if blocker_chunks:
+                    with st.spinner("Analyzing project blockers..."):
+                        st.session_state.blocker_analysis = analyze_blockers(blocker_chunks)
+                else:
+                    st.warning("No relevant blocker information found in the uploaded project documents.")
 
     # -------------------------------------------------
     # DISPLAY SCOPE ANALYSIS
@@ -2848,8 +3118,22 @@ if selected_page == "Project Scope":
 
         st.info(
             "No scope analysis is available yet. "
-            "Click Analyze Project Scope."
+            "Open Project Scope with processed documents to generate it."
         )
+
+    if st.session_state.get("risk_analysis"):
+        st.markdown("### ⚠️ Project Risks")
+        with st.expander("View Complete Risk Analysis", expanded=True):
+            st.markdown(_response_text(st.session_state.risk_analysis))
+    else:
+        st.info("Risk analysis will appear here when relevant project information is available.")
+
+    if st.session_state.get("blocker_analysis"):
+        st.markdown("### 🚧 Project Blockers & Actions")
+        with st.expander("View Complete Blocker Analysis", expanded=True):
+            st.markdown(_response_text(st.session_state.blocker_analysis))
+    else:
+        st.info("Blocker analysis will appear here when relevant project information is available.")
 
     # -------------------------------------------------
     # BACK TO HOME
@@ -2909,54 +3193,6 @@ if selected_page == "Risks & Forecast":
     </div>
     """)
 
-    st.markdown("### ⚠️ Analyze Project Risks")
-
-    if st.button(
-        "⚠️ Analyze Project Risks",
-        type="primary",
-        use_container_width=True,
-        key="analyze_risks_button"
-    ):
-
-        if not st.session_state.get("processed_documents"):
-
-            st.warning(
-                "No project documents have been processed yet. "
-                "Please go to Documents, upload your project files, "
-                "and process them first."
-            )
-
-        else:
-
-            risk_chunks = retrieve_documents(
-                "project risks blockers delays dependencies "
-                "schedule delivery challenges issues problems",
-                top_k=6
-            )
-
-            if risk_chunks:
-
-                with st.spinner(
-                    "Analyzing project risks..."
-                ):
-
-                    risk_analysis = analyze_risks(
-                        risk_chunks
-                    )
-
-                    st.session_state.risk_analysis = risk_analysis
-
-                st.success(
-                    "Project risk analysis completed."
-                )
-
-            else:
-
-                st.warning(
-                    "No relevant project risk information found "
-                    "in the uploaded project documents."
-                )
-
     # -------------------------------------------------
     # RISK ANALYSIS RESULT
     # -------------------------------------------------
@@ -2972,6 +3208,8 @@ if selected_page == "Risks & Forecast":
             st.markdown(
                 _response_text(st.session_state.risk_analysis)
             )
+    else:
+        st.info("Open Project Scope to generate the project risk analysis.")
 
     # -------------------------------------------------
     # BACK TO HOME
@@ -3031,62 +3269,6 @@ if selected_page == "Blockers & Actions":
 
     </div>
     """)
-
-    st.markdown("### 🚧 Analyze Project Blockers")
-
-    # -------------------------------------------------
-    # ANALYZE BLOCKERS BUTTON
-    # -------------------------------------------------
-
-    if st.button(
-        "🚧 Analyze Blockers & Actions",
-        type="primary",
-        use_container_width=True,
-        key="analyze_blockers_button"
-    ):
-
-        if not st.session_state.get("processed_documents"):
-
-            st.warning(
-                "No project documents have been processed yet. "
-                "Please go to Documents, upload your project files, "
-                "and process them first."
-            )
-
-        else:
-
-            blocker_chunks = retrieve_documents(
-                "current blockers unresolved issues pending decisions "
-                "action items dependencies delays problems "
-                "testing integration development schedule",
-                top_k=10
-            )
-
-            if blocker_chunks:
-
-                with st.spinner(
-                    "Analyzing project blockers..."
-                ):
-
-                    blocker_analysis = analyze_blockers(
-                        blocker_chunks
-                    )
-
-                    st.session_state.blocker_analysis = (
-                        blocker_analysis
-                    )
-
-                st.success(
-                    "Blocker analysis completed."
-                )
-
-            else:
-
-                st.warning(
-                    "No relevant blocker information found "
-                    "in the uploaded project documents."
-                )
-
 
 # -------------------------------------------------
 # DISPLAY BLOCKERS
@@ -3335,7 +3517,7 @@ if selected_page == "Blockers & Actions":
 
         st.info(
             "No blocker analysis is available yet. "
-            "Click Analyze Blockers & Actions."
+            "Open Project Scope to generate it from processed documents."
         )
 
     st.divider()
@@ -3516,6 +3698,82 @@ if selected_page == "Documentation":
 
     if documentation:
 
+        clean_documentation = _response_text(documentation)
+        clean_documentation = clean_documentation.replace("\\n", "\n")
+        clean_documentation = clean_documentation.replace("<br />", "\n").replace("<br/>", "\n").replace("<br>", "\n")
+        clean_documentation = re.sub(
+            r"(?m)^\s*(?:[-*•]\s*)?\*\*\s*[-*•]\s*([^*]+?)\s*\*\*\s*:\s*",
+            r"\1: ",
+            clean_documentation,
+        )
+        clean_documentation = re.sub(
+            r"(?m)^\s*(?:[-*•]\s*)?\*\*([^*]+?)\*\*\s*:\s*",
+            r"\1: ",
+            clean_documentation,
+        )
+        initial_sections = list(re.finditer(
+            r"(?m)^#\s+(\d+)\.\s+(USER STORIES|RISK REGISTER|ACTION ITEMS|PROJECT SUMMARY)\s*$",
+            clean_documentation,
+        ))
+        story_heading = next((match for match in initial_sections if match.group(2) == "USER STORIES"), None)
+        if story_heading:
+            story_end = next((match.start() for match in initial_sections if match.start() > story_heading.start()), len(clean_documentation))
+            story_body = clean_documentation[story_heading.end():story_end]
+            has_renderable_stories = (
+                re.search(r"(?m)^US-\d+\s*$", story_body)
+                and re.search(r"(?m)^User Story:\s*.+$", story_body)
+                and re.search(r"(?m)^Related Module:\s*.+$", story_body)
+            )
+            story_context = "\n".join(
+                [
+                    str(document.get("text", document.get("content", "")))
+                    if isinstance(document, dict) else str(document)
+                    for document in (st.session_state.get("processed_documents", []) or [])
+                ]
+                + [str(st.session_state.get("scope_analysis", ""))]
+            )
+            story_fallback = _fallback_user_stories(story_context) if not has_renderable_stories else ""
+            if story_fallback:
+                clean_documentation = (
+                    clean_documentation[:story_heading.end()]
+                    + "\n\n" + story_fallback + "\n\n"
+                    + clean_documentation[story_end:]
+                )
+        initial_sections = list(re.finditer(
+            r"(?m)^#\s+(\d+)\.\s+(USER STORIES|RISK REGISTER|ACTION ITEMS|PROJECT SUMMARY)\s*$",
+            clean_documentation,
+        ))
+        section_bodies = {}
+        for section_index, heading_match in enumerate(initial_sections):
+            section_end = initial_sections[section_index + 1].start() if section_index + 1 < len(initial_sections) else len(clean_documentation)
+            section_bodies[heading_match.group(2)] = clean_documentation[heading_match.end():section_end].strip()
+        stories = section_bodies.get("USER STORIES", "")
+        if not (
+            re.search(r"(?m)^US-\d+\s*$", stories)
+            and re.search(r"(?m)^User Story:\s*.+$", stories)
+            and re.search(r"(?m)^Related Module:\s*.+$", stories)
+        ):
+            stories = "Not found in the provided project information."
+        risk_records = _format_risk_records(
+            st.session_state.get("risk_analysis", ""),
+            section_bodies.get("RISK REGISTER", ""),
+        )
+        actions = _clean_action_items(section_bodies.get("ACTION ITEMS", ""))
+        summary = _format_project_summary(section_bodies.get("PROJECT SUMMARY", ""))
+        if not summary:
+            summary = section_bodies.get("PROJECT SUMMARY", "Not found in the provided project information.")
+        cleaned_sections = (
+            ("USER STORIES", stories),
+            ("RISK REGISTER", risk_records or "Not found in the provided project information."),
+            ("ACTION ITEMS", actions or "Not found in the provided project information."),
+            ("PROJECT SUMMARY", summary),
+        )
+        clean_documentation = "\n\n".join(
+            f"# {index}. {title}\n\n{content}"
+            for index, (title, content) in enumerate(cleaned_sections, start=1)
+        )
+        st.session_state.documentation = clean_documentation
+
         st.markdown(
             "### 📋 Generated Project Documentation"
         )
@@ -3524,198 +3782,66 @@ if selected_page == "Documentation":
             "📄 View Complete Project Documentation",
             expanded=True
         ):
-
-            clean_documentation = str(
-                documentation
-            )
-
-            # -----------------------------------------
-            # CLEAN TEXT
-            # -----------------------------------------
-
-            clean_documentation = (
-                clean_documentation.replace(
-                    "\\n",
-                    "\n"
-                )
-            )
-
-            clean_documentation = (
-                clean_documentation.replace(
-                    "<br>",
-                    "\n"
-                )
-            )
-
-            clean_documentation = (
-                clean_documentation.replace(
-                    "<br/>",
-                    "\n"
-                )
-            )
-
-            clean_documentation = (
-                clean_documentation.replace(
-                    "<br />",
-                    "\n"
-                )
-            )
-
-            # -----------------------------------------
-            # SECTION COLORS
-            # -----------------------------------------
-
-            section_colors = {
-
-                "1": "#b58cff",
-                "2": "#7c9cff",
-                "3": "#7ed6a5",
-                "4": "#38bdf8",
-                "5": "#b58cff",
-                "6": "#7c9cff",
-                "7": "#7ed6a5",
-                "8": "#38bdf8",
-                "9": "#ff9f43",
-                "10": "#ff6f91",
-                "11": "#7ed6a5",
-                "12": "#b58cff",
-                "13": "#38bdf8",
-                "14": "#7c9cff",
-                "15": "#b58cff",
-                "16": "#ff9f43",
-                "17": "#38bdf8",
-                "18": "#7ed6a5",
-                "19": "#ff6f91",
-                "20": "#b58cff"
-            }
-
-            # -----------------------------------------
-            # SECTION ICONS
-            # -----------------------------------------
-
-            section_icons = {
-
-                "1": "📋",
-                "2": "🎯",
-                "3": "❗",
-                "4": "📐",
-                "5": "🧩",
-                "6": "📌",
-                "7": "👤",
-                "8": "📦",
-                "9": "📅",
-                "10": "⚠️",
-                "11": "🚧",
-                "12": "💚",
-                "13": "📊",
-                "14": "🏗️",
-                "15": "💻",
-                "16": "🤖",
-                "17": "🔗",
-                "18": "💬",
-                "19": "🧪",
-                "20": "📝"
-            }
-
-            # -----------------------------------------
-            # SPLIT DOCUMENTATION INTO SECTIONS
-            # -----------------------------------------
-
-            sections = re.split(
-                r"(?=^#\s+\d+\.\s+)",
+            section_matches = list(re.finditer(
+                r"(?m)^#\s+(\d+)\.\s+(USER STORIES|RISK REGISTER|ACTION ITEMS|PROJECT SUMMARY)\s*$",
                 clean_documentation,
-                flags=re.MULTILINE
-            )
+            ))
+            for section_index, heading_match in enumerate(section_matches):
+                section_number, section_title = heading_match.groups()
+                section_end = section_matches[section_index + 1].start() if section_index + 1 < len(section_matches) else len(clean_documentation)
+                section_content = clean_documentation[heading_match.end():section_end].strip()
+                st.markdown(f"### {section_number}. {section_title.title()}")
 
-            # -----------------------------------------
-            # DISPLAY EACH SECTION
-            # -----------------------------------------
-
-            for section in sections:
-
-                section = section.strip()
-
-                if not section:
-                    continue
-
-                # -------------------------------------
-                # FIND SECTION HEADING
-                # -------------------------------------
-
-                heading_match = re.match(
-                    r"^#\s+(\d+)\.\s+(.+)",
-                    section
-                )
-
-                if not heading_match:
-
-                    st.markdown(section)
-
-                    continue
-
-                section_number = (
-                    heading_match.group(1)
-                )
-
-                section_title = (
-                    heading_match.group(2).strip()
-                )
-
-                color = section_colors.get(
-                    section_number,
-                    "#8b5cf6"
-                )
-
-                icon = section_icons.get(
-                    section_number,
-                    "📄"
-                )
-
-                content = section[
-                    heading_match.end():
-                ].strip()
-
-                # -------------------------------------
-                # SECTION HEADER
-                # -------------------------------------
-
-                st.html(
-                    f"""
-                    <div style="
-                        border-left:5px solid {color};
-                        border-radius:12px;
-                        padding:14px 18px;
-                        margin:26px 0 14px 0;
-                        background:#151922;
-                        box-shadow:
-                            0 5px 18px rgba(0,0,0,0.15);
-                    ">
-
-                        <div style="
-                            font-size:20px;
-                            font-weight:750;
-                            color:#ffffff;
-                        ">
-
-                            {icon}
-                            {section_number}.
-                            {section_title}
-
-                        </div>
-
-                    </div>
-                    """
-                )
-
-                # -------------------------------------
-                # SECTION CONTENT
-                # -------------------------------------
-
-                if content:
-
-                    st.markdown(
-                        content
-                    )
+                if section_title == "USER STORIES":
+                    records = [part.strip() for part in re.split(r"(?m)(?=^US-\d+\s*$)", section_content) if part.strip()]
+                    displayed_stories = 0
+                    for record in records:
+                        fields = dict(re.findall(r"(?m)^(User Story|Related Module):\s*(.+?)\s*$", record))
+                        if not fields:
+                            continue
+                        displayed_stories += 1
+                        with st.container(border=True):
+                            story_id = record.splitlines()[0].strip()
+                            st.caption(story_id)
+                            if fields.get("User Story"):
+                                st.markdown(fields["User Story"])
+                            if fields.get("Related Module"):
+                                st.caption(f"Related Module: {fields['Related Module']}")
+                    if not displayed_stories:
+                        st.caption("No supported user stories were found in the current project information.")
+                elif section_title == "RISK REGISTER":
+                    records = [part.strip() for part in re.split(r"(?m)(?=^\s*(?:[-*•]\s*)?Risk(?:\s+\d+)?\s*:)", section_content) if part.strip()]
+                    for record in records:
+                        lines = record.splitlines()
+                        with st.container(border=True):
+                            risk_title = re.sub(r"^\s*(?:[-*•]\s*)?", "", lines[0].strip())
+                            risk_title = risk_title.replace("**", "")
+                            st.markdown(f"**{risk_title}**")
+                            for line in lines[1:]:
+                                match = re.match(r"^\s*([^:]+):\s*(.+?)\s*$", line)
+                                if match:
+                                    st.markdown(f"**{match.group(1)}:** {match.group(2)}")
+                elif section_title == "ACTION ITEMS":
+                    records = [part.strip() for part in re.split(r"(?m)(?=^Action\s+\d+\s*:)", section_content) if part.strip()]
+                    for record in records:
+                        lines = record.splitlines()
+                        with st.container(border=True):
+                            st.markdown(f"**{lines[0].strip()}**")
+                            for line in lines[1:]:
+                                match = re.match(r"^\s*([^:]+):\s*(.+?)\s*$", line)
+                                if match:
+                                    st.caption(f"{match.group(1)}: {match.group(2)}")
+                else:
+                    for field_match in re.finditer(
+                        r"(?ms)^([^:\n]+):\s*\n((?:(?:\s*[-*•]\s+.+|\s+.+)\n?)*)",
+                        section_content,
+                    ):
+                        field_name = field_match.group(1).strip()
+                        field_value = field_match.group(2).strip()
+                        if field_value:
+                            with st.container(border=True):
+                                st.markdown(f"**{field_name}**")
+                                st.markdown(field_value)
 
         # -----------------------------------------
         # DOWNLOAD GENERATED DOCUMENTATION
@@ -3724,11 +3850,7 @@ if selected_page == "Documentation":
         from io import BytesIO
         from docx import Document
 
-        download_text = str(documentation)
-        download_text = download_text.replace("\\n", "\n")
-        download_text = download_text.replace("<br />", "\n")
-        download_text = download_text.replace("<br/>", "\n")
-        download_text = download_text.replace("<br>", "\n")
+        download_text = clean_documentation
 
         section_heading_pattern = re.compile(
             r"^\s*#*\s*(?:\d+\.\s*)?(USER STORIES|RISK REGISTER|"

@@ -4,6 +4,18 @@ from difflib import SequenceMatcher
 from src.llm import generate_answer
 
 
+def _build_document_context(retrieved_documents):
+    document_parts = []
+
+    for document in retrieved_documents:
+        text = document.get("text", "")
+        if text and text.strip():
+            filename = document.get("filename", "Unknown document")
+            document_parts.append(f"Source: {filename}\nContent:\n{text}")
+
+    return "\n\n".join(document_parts)
+
+
 def _build_context(
     retrieved_documents,
     scope_analysis="",
@@ -15,27 +27,7 @@ def _build_context(
     Build complete project context.
     """
 
-    document_parts = []
-
-    for document in retrieved_documents:
-
-        text = document.get("text", "")
-
-        if text and text.strip():
-
-            filename = document.get(
-                "filename",
-                "Unknown document"
-            )
-
-            document_parts.append(
-                f"Source: {filename}\n"
-                f"Content:\n{text}"
-            )
-
-    context = "\n\n".join(
-        document_parts
-    )
+    context = _build_document_context(retrieved_documents)
 
     # Add Scope Analysis
     if scope_analysis:
@@ -143,14 +135,20 @@ def _fallback_user_stories(context):
         ("Notification", ("notification",)),
         ("Integration Testing", ("integration testing",)),
     )
-    normalized_context = context.casefold()
-    stories = [
-        f"- I want to use the documented {capability} capability."
+    normalized_context = re.sub(r"[^a-z0-9]+", " ", context.casefold())
+    capabilities = [
+        capability
         for capability, evidence_terms in documented_capabilities
-        if any(term in normalized_context for term in evidence_terms)
+        if any(re.sub(r"[^a-z0-9]+", " ", term.casefold()) in normalized_context for term in evidence_terms)
     ]
-
-    return "\n".join(stories)
+    return "\n\n".join(
+        f"US-{index:02d}\n"
+        f"User Story: As a project user, I want to use the documented "
+        f"{capability} capability so that project work involving "
+        f"{capability} is supported.\n"
+        f"Related Module: {capability}"
+        for index, capability in enumerate(capabilities, start=1)
+    )
 
 
 def _is_unusable_section(content, missing_information):
@@ -177,96 +175,126 @@ def _usable_user_stories(content, missing_information):
 
 def _extract_risk_records(*sources):
     risk_start = re.compile(
-        r"(?im)^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?(?:\d+[.)]\s*)?"
+        r"(?im)^\s*(?:#{1,6}\s*)?(?:[-*•]\s*)?(?:\d+[.)]\s*)?"
         r"(?:\*\*)?Risk(?:\s+\d+)?(?:\*\*)?\s*:\s*(?:\*\*)?(.+?)\s*$"
     )
     field_pattern = re.compile(
         r"(?i)^\s*(?:[-*]\s*)?(?:\d+[.)]\s*)?(?:\*\*)?"
-        r"(Potential Project Impact|Recommended Action|Required Action|"
-        r"Description|Impact|Probability|Likelihood|Severity|Owner|Status|"
+        r"(Mitigation\s*/\s*Required Action|Severity/Impact|Potential Project Impact|Recommended Action|Required Action|"
+        r"Description|Reason|Impact|Probability|Likelihood|Severity|Owner|Status|"
         r"Mitigation)\s*\*{0,2}\s*[:\-]\s*\*{0,2}\s*(.*?)\s*$"
     )
     records = {}
 
+    def add_record(name, fields):
+        name = re.sub(r"\s+", " ", name.replace("**", "")).strip(" -*•|:")
+        if (
+            not name
+            or len(name) > 240
+            or "|" in name
+            or re.fullmatch(r"(?i)(?:management|analysis|register|summary|pending|blocked|risk)", name)
+            or re.match(r"(?i)^(?:task\s*#?\w+|t\d+|project health|scope|blocker)\b", name)
+            or re.search(r"(?i)\b(?:\d{1,3}\s*/\s*100|completed|in progress|not started)\b", name)
+        ):
+            return
+        key = re.sub(r"[^a-z0-9]+", " ", re.sub(r"(?i)^Risk(?:\s+\d+)?\s*:\s*", "", name).casefold()).strip()
+        for old_key, old_record in records.items():
+            old_words, new_words = set(old_key.split()), set(key.split())
+            overlap = len(old_words & new_words) / max(len(old_words | new_words), 1)
+            if (
+                key == old_key
+                or (old_words and new_words and old_words <= new_words)
+                or (old_words and new_words and new_words <= old_words)
+                or (old_words and new_words and overlap >= 0.82)
+                or SequenceMatcher(None, old_key, key).ratio() >= 0.9
+            ):
+                old_record.update({field: value for field, value in fields.items() if value and not old_record.get(field)})
+                return
+        records[key] = {"Risk": name, **{field: value for field, value in fields.items() if value}}
+
     for source in sources:
         text = str(source or "").replace("\\n", "\n")
+        normalized_lines = []
+        for line in text.splitlines():
+            line = re.sub(
+                r"^\s*(?:[-*•]\s*)?\*\*\s*[-*•]\s*([^*]+?)\s*\*\*\s*:\s*",
+                r"\1: ",
+                line,
+            )
+            line = re.sub(
+                r"^\s*(?:[-*•]\s*)?\*\*([^*]+?)\*\*\s*:\s*",
+                r"\1: ",
+                line,
+            )
+            normalized_lines.append(line)
+        text = "\n".join(normalized_lines)
+        lines = text.splitlines()
         matches = list(risk_start.finditer(text))
         for index, match in enumerate(matches):
             name = match.group(1).strip().strip("*")
-            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
-            block = text[match.end():end]
-            fields = {}
-            current_field = None
-
+            block_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            block = text[match.end():block_end]
+            fields, current_field = {}, None
             for line in block.splitlines():
-                if line.lstrip().startswith(("=====", "#")) or re.match(
-                    r"(?i)^\s*Overall Risk Summary\s*:", line
-                ):
+                if "|" in line or line.lstrip().startswith(("=====", "#")):
                     current_field = None
                     continue
-
                 field_match = field_pattern.match(line)
                 if field_match:
                     label = field_match.group(1).casefold()
-                    if label in ("potential project impact", "impact"):
-                        current_field = "Impact"
-                    elif label in ("probability", "likelihood"):
-                        current_field = "Probability"
-                    elif label == "recommended action":
-                        current_field = "Recommended Action"
-                    elif label == "required action":
-                        current_field = "Required Action"
-                    else:
-                        current_field = label.title()
-
-                    value = field_match.group(2).strip().strip("*")
-                    if value:
+                    current_field = {
+                        "mitigation / required action": "Mitigation",
+                        "severity/impact": "Severity/Impact",
+                        "potential project impact": "Impact", "impact": "Impact",
+                        "reason": "Description",
+                        "probability": "Probability", "likelihood": "Probability",
+                        "recommended action": "Recommended Action", "required action": "Required Action",
+                    }.get(label, label.title())
+                    value = field_match.group(2).strip().strip("* ")
+                    value = re.sub(r"\*\*(.*?)\*\*", r"\1", value)
+                    value = re.sub(r"(?i)\s+Priority\s*:\s*[^\n]+$", "", value).strip()
+                    if value and not value.casefold().startswith(("not found", "not specified")):
                         fields[current_field] = value
                     continue
-
-                if current_field and line.strip():
+                if current_field and line.strip() and not line.strip().startswith(("Source:", "Content:")):
                     value = line.strip().strip("-*• ")
-                    if value and not value.startswith("Source:"):
-                        fields[current_field] = " ".join(
-                            filter(None, (fields.get(current_field, ""), value))
-                        )
+                    if value and "|" not in value:
+                        fields[current_field] = " ".join(filter(None, (fields.get(current_field, ""), value)))
+            add_record(name, fields)
 
-            record_key = name.casefold()
-            existing = records.setdefault(record_key, {"Risk": name})
-            existing.update({key: value for key, value in fields.items() if value})
-
-    # Risk facts in uploaded documents and analyses are not always formatted as
-    # explicit ``Risk: ...`` records. Preserve only the source lines that state
-    # a concrete uncertainty, delay, dependency, or limitation.
-    risk_evidence_pattern = re.compile(
-        r"(?i)\b(?:risk|delay(?:ed)?|blocked|blocker|pending|not finalized|"
-        r"unfinished|limited(?:\s+[\w-]+){0,3}\s+availability|"
-        r"availability limitation|"
-        r"dependency|schedule slip|schedule delay|behind schedule)\b"
-    )
-    for source in sources:
-        for line in str(source or "").replace("\\n", "\n").splitlines():
-            evidence = re.sub(r"^\s*(?:[-*•]\s*|\d+[.)]\s*)", "", line)
-            evidence = evidence.replace("**", "").strip()
-            heading_text = evidence.strip(" =#*-\t")
-            if re.fullmatch(
-                r"(?i)#{0,6}\s*(?:risk(?: analysis| register)?|key risks|"
-                r"overall risk summary)\s*:?\s*",
-                heading_text
-            ):
+        # Tables are accepted only inside the risk-specific input (the LLM risk
+        # response or Risk Analysis). Headers define columns; numeric row IDs
+        # without a header are interpreted only as Risk | Severity rows.
+        table_headers = None
+        for line in lines:
+            if "|" not in line:
                 continue
-            if (
-                not evidence
-                or evidence.casefold().startswith(("source:", "content:"))
-                or len(evidence) > 500
-                or not risk_evidence_pattern.search(evidence)
-            ):
+            cells = [cell.strip().replace("**", "") for cell in line.strip().strip("|").split("|")]
+            normalized_cells = [re.sub(r"[^a-z ]", "", cell.casefold()).strip() for cell in cells]
+            if any("risk" == cell or cell.startswith("risk name") for cell in normalized_cells):
+                table_headers = normalized_cells
                 continue
-
-            normalized = re.sub(r"(?i)^risk\s*:\s*", "", evidence).strip()
-            if not normalized or normalized.casefold() in records:
+            if not cells or all(re.fullmatch(r"[-: ]+", cell or "-") for cell in cells):
                 continue
-            records.setdefault(normalized.casefold(), {"Risk": normalized})
+            if table_headers:
+                field_aliases = {
+                    "risk": "Risk", "risk name": "Risk", "severity": "Severity",
+                    "impact": "Impact", "severity impact": "Severity/Impact",
+                    "probability": "Probability", "likelihood": "Probability",
+                    "owner": "Owner", "status": "Status", "description": "Description",
+                    "reason": "Description", "mitigation": "Mitigation",
+                    "recommended action": "Recommended Action", "required action": "Required Action",
+                }
+                row = {field_aliases[header]: value for header, value in zip(table_headers, cells) if header in field_aliases and value}
+                risk_name = row.pop("Risk", "")
+                if risk_name and risk_name.casefold() not in {"risk", "risk name"}:
+                    add_record(risk_name, row)
+                continue
+            if len(cells) >= 2 and re.fullmatch(r"\d+", cells[0]) and cells[1].casefold() not in {"risk", "risk name"}:
+                fields = {}
+                if len(cells) >= 3 and cells[2].casefold() in {"high", "medium", "low", "critical"}:
+                    fields["Severity"] = cells[2]
+                add_record(cells[1], fields)
 
     return list(records.values())
 
@@ -274,25 +302,23 @@ def _extract_risk_records(*sources):
 def _fallback_risk_register(context, risk_analysis=""):
     records = _extract_risk_records(risk_analysis, context)
     output = []
-    field_order = (
-        "Description",
-        "Impact",
-        "Severity",
-        "Probability",
-        "Owner",
-        "Status",
-        "Mitigation",
-        "Recommended Action",
-        "Required Action",
-    )
-
-    for record in records:
-        lines = [f"- **Risk:** {record['Risk']}"]
-        lines.extend(
-            f"  - **{field}:** {record[field]}"
-            for field in field_order
-            if record.get(field)
+    for index, record in enumerate(records, start=1):
+        lines = [f"Risk {index}: {record['Risk']}"]
+        severity_impact = record.get("Severity/Impact") or " / ".join(
+            record[field] for field in ("Severity", "Impact") if record.get(field)
         )
+        if severity_impact:
+            lines.append(f"Severity/Impact: {severity_impact}")
+        if record.get("Probability"):
+            lines.append(f"Probability: {record['Probability']}")
+        lines.append(f"Owner: {record.get('Owner', 'Not specified')}")
+        if record.get("Status"):
+            lines.append(f"Status: {record['Status']}")
+        if record.get("Description"):
+            lines.append(f"Description: {record['Description']}")
+        action = record.get("Mitigation") or record.get("Recommended Action") or record.get("Required Action")
+        if action:
+            lines.append(f"Mitigation / Required Action: {action}")
         output.append("\n".join(lines))
 
     return "\n".join(output)
@@ -491,6 +517,151 @@ def _deduplicate_action_items(content):
     return "\n".join(kept_lines).strip()
 
 
+def _clean_action_items(content):
+    action_verbs = re.compile(
+        r"(?i)^(?:confirm|prepare|complete|continue|assign|track|escalate|"
+        r"update|review|create|test|resolve|implement|finalize|integrate|"
+        r"document|coordinate|validate|deploy|conduct|monitor|prioritize|"
+        r"request|verify|provide|ensure|schedule|identify|define|develop)\b"
+    )
+    records = []
+    for line in str(content or "").replace("\\n", "\n").splitlines():
+        line = line.strip()
+        if not line or "|" in line or line.startswith(("#", "=====")):
+            continue
+        line = line.replace("**", "").replace("`", "")
+        if re.fullmatch(r"\d+[.)]", line):
+            continue
+        item_match = re.match(r"^(?:[-*•]|\d+[.)])\s+(.+?)\s*$", line)
+        candidate = item_match.group(1).strip() if item_match else line
+        candidate = re.sub(r"(?i)^Action\s*\d*\s*[:.)-]\s*", "", candidate).strip()
+        if re.match(r"(?i)^(?:owner|priority|status|due date)\s*:", candidate):
+            if records:
+                label, value = candidate.split(":", 1)
+                if label.casefold() in ("owner", "priority") and value.strip():
+                    records[-1][label.title()] = value.strip()
+            continue
+        if candidate.casefold().startswith((
+            "not found", "no documented actions", "action items:",
+            "risk register", "risk analysis", "blocker analysis", "health analysis",
+            "project scope", "project summary",
+        )):
+            continue
+        if candidate.casefold().rstrip(".!") in {"pending", "blocked", "completed", "in progress", "not started"}:
+            continue
+        if re.match(r"(?i)^(?:risk(?: register| analysis)?|blocker analysis|health analysis|scope analysis)\s*[:#]", candidate):
+            continue
+        if not action_verbs.match(candidate):
+            continue
+        metadata = {}
+        for label in ("Owner", "Priority"):
+            match = re.search(rf"(?i)(?:\||;|—|–)\s*{label}\s*:\s*([^;|]+)", candidate)
+            if match:
+                metadata[label] = match.group(1).strip()
+                candidate = candidate[:match.start()].strip()
+        candidate = candidate.strip(" -*•|;:")
+        if candidate:
+            records.append({"Action": candidate, **metadata})
+
+    if not records:
+        return ""
+
+    dedupe_input = "\n".join(
+        "- " + record["Action"] + "".join(
+            f" | {field}: {record[field]}" for field in ("Owner", "Priority") if record.get(field)
+        )
+        for record in records
+    )
+    deduped_lines = _deduplicate_action_items(dedupe_input).splitlines()
+    cleaned_records = []
+    for line in deduped_lines:
+        match = re.match(r"^\s*[-*•]\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        value = match.group(1)
+        record = {"Action": value}
+        for label in ("Owner", "Priority"):
+            metadata_match = re.search(rf"(?i)(?:\||;|—|–)\s*{label}\s*:\s*([^;|]+)", value)
+            if metadata_match:
+                record[label] = metadata_match.group(1).strip()
+                value = value[:metadata_match.start()].strip()
+        record["Action"] = value
+        cleaned_records.append(record)
+
+    return "\n\n".join(
+        f"Action {index}: {record['Action']}"
+        + (f"\nOwner: {record['Owner']}" if record.get("Owner") else "")
+        + (f"\nPriority: {record['Priority']}" if record.get("Priority") else "")
+        for index, record in enumerate(cleaned_records, start=1)
+    )
+
+
+def _format_risk_records(*sources):
+    records = _extract_risk_records(*sources)
+    rendered = []
+    for index, record in enumerate(records, start=1):
+        lines = [f"Risk {index}: {record['Risk']}"]
+        severity_impact = record.get("Severity/Impact") or " / ".join(
+            record[field] for field in ("Severity", "Impact") if record.get(field)
+        )
+        if severity_impact:
+            lines.append(f"Severity/Impact: {severity_impact}")
+        if record.get("Probability"):
+            lines.append(f"Probability: {record['Probability']}")
+        lines.append(f"Owner: {record.get('Owner', 'Not specified')}")
+        if record.get("Status"):
+            lines.append(f"Status: {record['Status']}")
+        if record.get("Description"):
+            lines.append(f"Description: {record['Description']}")
+        action = record.get("Mitigation") or record.get("Recommended Action") or record.get("Required Action")
+        if action:
+            lines.append(f"Mitigation / Required Action: {action}")
+        rendered.append("\n".join(lines))
+    return "\n\n".join(rendered)
+
+
+def _format_project_summary(content):
+    labels = (
+        ("Project Name", ("Project Name", "Project Title")),
+        ("Project Objective", ("Project Objective", "Objective")),
+        ("Current Sprint / Status", ("Current Sprint / Status", "Current Sprint", "Current Status", "Project Status")),
+        ("Completed Work", ("Completed Work", "Completed")),
+        ("Work In Progress", ("Work In Progress", "In Progress", "Ongoing Work")),
+        ("Blocked / Pending Work", ("Blocked / Pending Work", "Blocked Work", "Pending Work", "Blocked / Pending")),
+        ("Key Risks", ("Key Risks", "Risks")),
+        ("Next Priorities", ("Next Priorities", "Next Priority", "Priorities")),
+    )
+    aliases = {alias.casefold(): label for label, names in labels for alias in names}
+    values = {}
+    current_label = None
+    for raw_line in str(content or "").replace("\\n", "\n").splitlines():
+        line = raw_line.strip().replace("**", "").replace("`", "")
+        if not line or line.startswith(("#", "=====")):
+            continue
+        match = re.match(r"^([^:：]+)\s*[:：]\s*(.*)$", line)
+        if "|" in line:
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) >= 2:
+                table_label = aliases.get(cells[0].casefold())
+                if table_label and cells[1] and not cells[1].casefold().startswith(("not found", "not specified", "---")):
+                    values.setdefault(table_label, []).append(cells[1])
+                    current_label = table_label
+            continue
+        if match and match.group(1).strip().casefold() in aliases:
+            current_label = aliases[match.group(1).strip().casefold()]
+            value = match.group(2).strip(" -*•")
+            if value and not value.casefold().startswith(("not found", "not specified", "n/a")):
+                values.setdefault(current_label, []).append(value)
+            continue
+        item = re.sub(r"^(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        if current_label and item and not item.casefold().startswith(("not found", "not specified", "n/a")):
+            values.setdefault(current_label, []).append(item)
+    return "\n".join(
+        f"{label}:\n" + "\n".join(f"- {value}" for value in dict.fromkeys(values[label]))
+        for label, _ in labels if values.get(label)
+    )
+
+
 def generate_project_documentation(
     retrieved_documents,
     scope_analysis="",
@@ -506,6 +677,7 @@ def generate_project_documentation(
     # BUILD COMPLETE CONTEXT
     # ---------------------------------------------
 
+    document_context = _build_document_context(retrieved_documents)
     context = _build_context(
         retrieved_documents,
         scope_analysis,
@@ -522,46 +694,63 @@ def generate_project_documentation(
         )
 
     missing_information = "Not found in the provided project information."
+    section_contexts = {
+        "USER STORIES": _build_context(retrieved_documents, scope_analysis=scope_analysis),
+        "RISK REGISTER": _build_context(retrieved_documents, risk_analysis=risk_analysis),
+        "ACTION ITEMS": _build_context(
+            retrieved_documents,
+            risk_analysis=risk_analysis,
+            blocker_analysis=blocker_analysis,
+        ),
+        "PROJECT SUMMARY": _build_context(
+            retrieved_documents,
+            scope_analysis=scope_analysis,
+            risk_analysis=risk_analysis,
+            blocker_analysis=blocker_analysis,
+        ),
+    }
 
     section_prompts = [
         (
             "USER STORIES",
             """
 You are generating only the User Stories section of project documentation.
-Read the provided project context and identify documented modules, features, requirements, and activities that describe project capabilities. Create one concise user story for each distinct supported capability; the source does not need a section labelled "User Stories" or user-story wording.
-Use only facts supported by the context. Do not invent a role or benefit. Write each story as a bullet in this simple format:
-- I want to [documented capability].
-Add an "As a ..." role or "so that ..." benefit only if the context explicitly supports it. Do not include placeholders for missing fields. Avoid duplicates. If no capability is documented, return exactly:
+Use only explicitly documented capabilities. Do not create a story for an API, UI, or integration separately when it is part of a documented parent capability. Use this format for each supported capability:
+US-01
+User Story: As a project user, I want to use [documented capability] functionality.
+Related Module: [documented capability]
+Do not invent a more specific role or benefit. Avoid duplicates. If no capability is documented, return exactly:
 Not found in the provided project information.
 
-Return only the story bullets, with no heading or other section.
+Return only the story records, with no heading or other section.
 """
         ),
         (
             "RISK REGISTER",
             """
 You are generating only the Risk Register section of project documentation.
-Review the entire provided context, including every retrieved document and optional analysis.
+Use the retrieved project documents and the Risk Analysis only. Do not treat Blocker Analysis, Health Analysis, Scope Analysis, status tables, or markdown table rows as separate risks.
 Treat documented unresolved dependencies or specifications, delays, resource limitations, blockers, and other explicit uncertainties as risk evidence even if they are not labeled "risk".
 Do not require the source to contain a section labelled "Risk Register". Include each distinct risk supported by the context, describing its documented uncertainty or blocker. Add an impact, likelihood, mitigation, owner, date, or status only when explicitly supported; omit unavailable fields instead of rejecting the risk or writing a missing-information placeholder. If no risk evidence is present, return exactly:
 Not found in the provided project information.
-Do not include a Project Health section or a separate Blockers section.
+Never create risks from a health score/dimension, a task/status row, a blocker heading, a table header, or an isolated word such as "Pending" or "Blocked".
 
-Return only concise readable bullets, with no heading or other section. Include documented mitigation or impact details inline only when available.
+For each risk provide a risk name and only supported fields: Severity/Impact, Probability, Owner, Status, Description, and Mitigation / Required Action. If no owner is documented, write "Not specified". Omit other unavailable fields.
+Return only concise risk records, with no heading or other section.
 """
         ),
         (
             "ACTION ITEMS",
             """
 You are generating only the Action Items section of project documentation.
-Review the entire provided context, including every retrieved document and optional analysis.
+Use the retrieved project documents, Risk Analysis, and Blocker Analysis only. Do not copy table headers, section headings, health scores, task rows, or markdown fragments.
 Extract documented action statements and actionable next steps supported by blockers, dependencies, unfinished integrations, or testing constraints. Where the context documents unfinished work or a dependency, state the direct step needed to resolve or complete it; do not require the source to phrase that step as an imperative.
 Avoid duplicate or repetitive actions and generic project-management actions.
 Do not invent actions, owners, priorities, due dates, or statuses. Omit unavailable metadata rather than adding a missing-information placeholder. Do not require the source to use a particular action-list heading.
 If no documented or clearly required action is supported by the context, return exactly:
 Not found in the provided project information.
 
-Return only concise readable bullets or a numbered list, with no heading or other section. Include an owner or other metadata inline only when the context provides it.
+Return concise actions as separate records. Include Owner or Priority only when the context provides them. Do not include a separate numbering-only line.
 """
         ),
         (
@@ -574,15 +763,15 @@ For every unavailable field, write exactly:
 Not found in the provided project information.
 Do not add subsections, health scoring, a RAG workflow, AI agents, or validation details.
 
-Return only these fields, with no heading or other section:
+Return only these fields when supported, with no heading or other section. Add Next Priorities only if explicit next priorities are supported by the context:
 Project Name:
 Project Objective:
-Main Modules / Features:
-Current Status:
+Current Sprint / Status:
 Completed Work:
 Work In Progress:
 Blocked / Pending Work:
 Key Risks:
+Next Priorities:
 """
         ),
     ]
@@ -594,7 +783,7 @@ Key Risks:
 
         section_content = _generate_section(
             prompt,
-            context
+            section_contexts[section_name]
         )
         had_section_content = bool(section_content)
 
@@ -606,32 +795,26 @@ Key Risks:
                 if not line.lstrip().startswith("#")
             ).strip()
 
-        if section_name == "USER STORIES" and not _usable_user_stories(
-            section_content,
-            missing_information
-        ):
-            section_content = _fallback_user_stories(context)
-        elif section_name == "RISK REGISTER" and _is_unusable_section(
-            section_content,
-            missing_information
-        ):
-            section_content = _fallback_risk_register(context, risk_analysis)
-        elif section_name == "ACTION ITEMS" and _is_unusable_section(
-            section_content,
-            missing_information
-        ):
-            section_content = _fallback_action_items(
-                context,
-                blocker_analysis,
-                risk_analysis
-            )
-
-        if section_name == "ACTION ITEMS":
-            section_content = _deduplicate_action_items(section_content)
-        elif section_name == "USER STORIES":
-            # Render one deterministic story per capability evidenced in context;
-            # module interfaces and integrations collapse to their parent capability.
-            section_content = _fallback_user_stories(context) or missing_information
+        if section_name == "USER STORIES":
+            section_content = _fallback_user_stories(section_contexts[section_name]) or missing_information
+        elif section_name == "RISK REGISTER":
+            section_content = _format_risk_records(
+                risk_analysis,
+                section_content,
+            ) or _fallback_risk_register("", risk_analysis) or missing_information
+        elif section_name == "ACTION ITEMS":
+            cleaned_actions = _clean_action_items(section_content)
+            if not cleaned_actions:
+                cleaned_actions = _clean_action_items(
+                    _fallback_action_items(
+                        section_contexts[section_name],
+                        blocker_analysis,
+                        risk_analysis,
+                    )
+                )
+            section_content = cleaned_actions or missing_information
+        elif section_name == "PROJECT SUMMARY":
+            section_content = _format_project_summary(section_content) or section_content.strip()
 
         if section_content and not had_section_content:
             successful_sections += 1
